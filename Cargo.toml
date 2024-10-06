@@ -2,6 +2,15 @@
 name = "winpipe"
 version = "0.1.0"
 edition = "2021"
+license = "MIT OR Apache-2.0"
+authors = ["Alexander Schütz <aschuetz@protonmail.com>"]
+keywords = ["pipe", "pipes", "windows", "named_pipes"]
+categories = ["api-bindings"]
+description = "Blocking rust wrapper for Windows named pipes with very similar api to UnixStream/UnixListen."
+readme = "README.md"
+repository = "https://github.com/AlexanderSchuetz97/winpipe"
+
+
 
 [dependencies]
 log = {version = "0.4.22", optional = true}
