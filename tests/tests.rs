@@ -1,7 +1,8 @@
 use colog::format::{CologStyle, DefaultCologStyle};
-use log::LevelFilter;
+use log::{info, LevelFilter};
 use serial_test::serial;
 use std::io::{ErrorKind, Read, Write};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 #[cfg(target_os = "windows")]
@@ -192,6 +193,22 @@ pub fn test_listen() {
     let mut dta = Vec::new();
     pip.read_to_end(&mut dta).unwrap();
     assert_eq!(b"OK", dta.as_slice());
+}
+
+#[cfg(target_os = "windows")]
+#[test]
+#[serial]
+pub fn test_accept_racy_already_connected() {
+    configure_colog();
+    for n in 0..100 {
+        info!("test_accept_racy_already_connected {}", n);
+        let pipe = Arc::new(WinListener::bind("\\\\.\\pipe\\my_pipe2").unwrap());
+        let cl = pipe.clone();
+        let th = thread::spawn(move || cl.accept());
+        let client = WinStream::connect("\\\\.\\pipe\\my_pipe2").unwrap();
+        th.join().unwrap().unwrap();
+        drop(client);
+    }
 }
 
 #[cfg(target_os = "windows")]

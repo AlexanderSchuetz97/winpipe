@@ -219,6 +219,7 @@ fn map_windows_error(win_error_code: u32) -> io::Error {
         0x00000003 => Some(ErrorKind::NotFound.into()),          //Path not found
         0x0000006d => Some(ErrorKind::BrokenPipe.into()),        //Broken pipe
         0x00000035 => Some(ErrorKind::NotFound.into()),          //The network path was not found
+        0x00000217 => Some(ErrorKind::AlreadyExists.into()),     //The pipe is already connected.
         _ => None,
     };
     if mapped.is_some() {
@@ -1809,28 +1810,61 @@ fn server<T: ToString>(
                 pipe.0,
                 overlapped.as_ref().as_const_param()
             );
-            coerce_error(ConnectNamedPipe(pipe, overlapped.as_mut().as_mut_param()))
-                .or_else(|e| permit_error(e, ErrorKind::WouldBlock, ()))
-                .inspect(|_| {
-                    #[cfg(feature = "logging")]
-                    trace!(
-                        "ConnectNamedPipe({:p}, {:p})=()",
-                        pipe.0,
-                        overlapped.as_ref().as_const_param()
-                    )
-                })
-                .inspect_err(|_e| {
-                    #[cfg(feature = "logging")]
-                    error!(
-                        "ConnectNamedPipe({:p}, {:p})={}",
-                        pipe.0,
-                        overlapped.as_ref().as_const_param(),
-                        _e
-                    )
-                })?;
+
+            let already_connected =
+                coerce_error(ConnectNamedPipe(pipe, overlapped.as_mut().as_mut_param()))
+                    .map(|_| true)
+                    .or_else(|e| permit_error(e, ErrorKind::WouldBlock, false))
+                    .or_else(|e| permit_error(e, ErrorKind::AlreadyExists, true))
+                    .inspect(|c| {
+                        #[cfg(feature = "logging")]
+                        trace!(
+                            "ConnectNamedPipe({:p}, {:p})={}",
+                            pipe.0,
+                            overlapped.as_ref().as_const_param(),
+                            *c
+                        )
+                    })
+                    .inspect_err(|_e| {
+                        #[cfg(feature = "logging")]
+                        error!(
+                            "ConnectNamedPipe({:p}, {:p})={}",
+                            pipe.0,
+                            overlapped.as_ref().as_const_param(),
+                            _e
+                        )
+                    })?;
             notifier.map(|notifier| notifier.send(()));
 
             loop {
+                if already_connected {
+                    let must_wait = cancel_io_ex(pipe, Some(overlapped.as_ref().as_const_param()))
+                        .map(|_| true)
+                        .or_else(|e| permit_error(e, ErrorKind::NotFound, false))
+                        .unwrap_or_else(|e| {
+                            //This scenario is probably unlikely.
+                            #[cfg(feature = "logging")]
+                            error!(
+                                "Failed to cancel async IO of already connected pipe. GetOverlappedResult will probably deadlock... ERROR={}",
+                                e
+                            );
+                            true
+                        });
+
+                    if must_wait {
+                        let mut count = u32::default();
+                        get_overlapped_result(
+                            pipe,
+                            overlapped.as_ref().as_const_param(),
+                            &mut count,
+                            true,
+                        )
+                        .or_else(|e| permit_error(e, ErrorKind::ConnectionAborted, ()))?;
+                    }
+
+                    break;
+                }
+
                 if abort_toggle
                     .as_ref()
                     .map(|e| e.load(SeqCst))
