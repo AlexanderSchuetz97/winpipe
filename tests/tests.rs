@@ -1,4 +1,3 @@
-use colog::format::{CologStyle, DefaultCologStyle};
 use log::{info, LevelFilter};
 use serial_test::serial;
 use std::io::{ErrorKind, Read, Write};
@@ -8,28 +7,11 @@ use std::time::Duration;
 #[cfg(target_os = "windows")]
 use winpipe::{WinListener, WinPipeSocketAddr, WinStream};
 
-fn configure_colog() {
-    _ = colog::default_builder()
-        .filter_level(LevelFilter::Trace)
-        .format(|buf, record| {
-            let sep = DefaultCologStyle.line_separator();
-            let prefix = DefaultCologStyle.prefix_token(&record.level());
-            writeln!(
-                buf,
-                "{} {:?} {}",
-                prefix,
-                thread::current().id(),
-                record.args().to_string().replace('\n', &sep),
-            )
-        })
-        .try_init();
-}
-
 #[cfg(target_os = "windows")]
 #[test]
 #[serial]
 pub fn test_pipe_stuck() {
-    configure_colog();
+    _ = trivial_log::init_stderr(LevelFilter::Trace);
     let (mut stream1, stream2) = WinStream::pair().unwrap();
     stream1.write_all("Hello".as_bytes()).unwrap();
     drop(stream1);
@@ -40,7 +22,7 @@ pub fn test_pipe_stuck() {
 #[test]
 #[serial]
 pub fn test_never_flush_close() {
-    configure_colog();
+    _ = trivial_log::init_stderr(LevelFilter::Trace);
     let (mut stream1, stream2) = WinStream::pair().unwrap();
     thread::spawn(move || {
         let stream2 = stream2;
@@ -57,7 +39,7 @@ pub fn test_never_flush_close() {
 #[test]
 #[serial]
 pub fn test_read_stuck_drop() {
-    configure_colog();
+    _ = trivial_log::init_stderr(LevelFilter::Trace);
     let (mut stream1, stream2) = WinStream::pair().unwrap();
     thread::spawn(move || {
         let stream2 = stream2;
@@ -75,7 +57,7 @@ pub fn test_read_stuck_drop() {
 #[test]
 #[serial]
 pub fn test_read_times_out_and_drop() {
-    configure_colog();
+    _ = trivial_log::init_stderr(LevelFilter::Trace);
     let (mut stream1, stream2) = WinStream::pair().unwrap();
     stream1
         .set_read_timeout(Some(Duration::from_millis(2000)))
@@ -91,7 +73,7 @@ pub fn test_read_times_out_and_drop() {
 #[test]
 #[serial]
 pub fn test_drop_does_flush() {
-    configure_colog();
+    _ = trivial_log::init_stderr(LevelFilter::Trace);
     let (mut stream1, mut stream2) = WinStream::pair().unwrap();
     let mut data = vec![0u8; 128];
     for (i, n) in data.iter_mut().enumerate() {
@@ -114,7 +96,7 @@ pub fn test_drop_does_flush() {
 #[test]
 #[serial]
 pub fn test_read_to_end() {
-    configure_colog();
+    _ = trivial_log::init_stderr(LevelFilter::Trace);
     let (mut stream1, mut stream2) = WinStream::pair().unwrap();
     let mut data = vec![0u8; 0x400000];
     for (i, n) in data.iter_mut().enumerate() {
@@ -137,7 +119,7 @@ pub fn test_read_to_end() {
 #[test]
 #[serial]
 pub fn test_infinite_read_abort() {
-    configure_colog();
+    _ = trivial_log::init_stderr(LevelFilter::Trace);
     let (stream1, mut stream2) = WinStream::pair().unwrap();
     let s2c = stream2.try_clone().unwrap();
     let jh = thread::spawn(move || {
@@ -158,7 +140,7 @@ pub fn test_infinite_read_abort() {
 #[test]
 #[serial]
 pub fn test_infinite_write_abort() {
-    configure_colog();
+    _ = trivial_log::init_stderr(LevelFilter::Trace);
     let (stream1, mut stream2) = WinStream::pair().unwrap();
     let s2c = stream2.try_clone().unwrap();
     let jh = thread::spawn(move || {
@@ -182,7 +164,7 @@ pub fn test_infinite_write_abort() {
 #[test]
 #[serial]
 pub fn test_listen() {
-    configure_colog();
+    _ = trivial_log::init_stderr(LevelFilter::Trace);
     let pipe = WinListener::bind("\\\\.\\pipe\\my_pipe").unwrap();
     thread::spawn(|| {
         let mut stream = WinStream::connect("\\\\.\\pipe\\my_pipe").unwrap();
@@ -199,7 +181,7 @@ pub fn test_listen() {
 #[test]
 #[serial]
 pub fn test_accept_racy_already_connected() {
-    configure_colog();
+    _ = trivial_log::init_stderr(LevelFilter::Trace);
     for n in 0..100 {
         info!("test_accept_racy_already_connected {}", n);
         let pipe = Arc::new(WinListener::bind("\\\\.\\pipe\\my_pipe2").unwrap());
@@ -215,7 +197,7 @@ pub fn test_accept_racy_already_connected() {
 #[test]
 #[serial]
 pub fn it_works() {
-    configure_colog();
+    _ = trivial_log::init_stderr(LevelFilter::Trace);
 
     _ = WinStream::connect("\\\\fubar\\pipe\\bubar");
 

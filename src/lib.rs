@@ -73,6 +73,27 @@
 //!     * If you are troubleshooting problems then I recommend using a log format which includes the thread id!
 //!     + To disable usage of the log crate use default-features=false in your Cargo.toml when including winpipe.
 //!
+#![allow(non_snake_case)]
+#![allow(non_camel_case_types)]
+#![deny(clippy::correctness)]
+#![deny(
+    clippy::perf,
+    clippy::complexity,
+    clippy::style,
+    clippy::nursery,
+    clippy::pedantic,
+    clippy::clone_on_ref_ptr,
+    clippy::decimal_literal_representation,
+    clippy::float_cmp_const,
+    clippy::missing_docs_in_private_items,
+    clippy::multiple_inherent_impl,
+    clippy::unwrap_used,
+    clippy::cargo_common_metadata,
+    clippy::used_underscore_binding
+)]
+#![allow(clippy::too_many_lines)]
+
+/// the actual implementation is in this module.
 #[cfg(target_os = "windows")]
 mod pipe;
 #[cfg(target_os = "windows")]
