@@ -62,6 +62,7 @@ fn coerce_error<T>(result: windows::core::Result<T>) -> io::Result<T> {
 }
 
 /// Close a Windows handle with logging
+#[allow(clippy::manual_assert)] //Depends on features
 unsafe fn close_handle(handle: HANDLE) {
     #[cfg(feature = "log")]
     trace!("CloseHandle({:p})", handle.0);
@@ -520,7 +521,9 @@ impl WinListener {
         defer! {
            trace!("WinListener::accept exiting took={}ms panic={}", start.elapsed().as_millis(), thread::panicking());
         }
-        let mut guard = self.0.receiver.lock().unwrap();
+        let mut guard = self.0.receiver.lock()
+            .map_err(|_| Error::other("mutex_write poisoned"))?;
+
         #[cfg(feature = "log")]
         trace!("WinListener::accept locked");
         if guard.join_handle.is_none() {
@@ -547,49 +550,32 @@ impl WinListener {
         let take_the_handle = |mut guard: MutexGuard<WinListenRcv>| {
             #[cfg(feature = "log")]
             trace!("WinListener::accept getting result from async thread handle");
-            return match guard.join_handle.take() {
-                Some(jh) => match jh.join() {
+
+            guard.join_handle.take().map_or_else(|| unreachable!("guard.join_handle.take()=>None"), |jh| match jh.join() {
                     Ok(result) => result
                         .map(|p| WinStream(Arc::new(p), self.0.addr.clone()))
                         .map(|p| (p, self.0.addr.clone()))
-                        .inspect(|(_p, _)| {
+                        .inspect(|(p, _)| {
                             #[cfg(feature = "log")]
                             trace!(
                                 "WinListener::accept successfully accepted pipe {:p}",
-                                _p.0.pipe_handle
+                                p.0.pipe_handle
                             );
+                            _=p;
                         })
-                        .inspect_err(|_e| {
+                        .inspect_err(|e| {
                             #[cfg(feature = "log")]
-                            error!("WinListener::accept failed with error {}", _e);
+                            error!("WinListener::accept failed with error {e}");
+                            _=e;
                         }),
                     Err(panic) => {
-                        if let Some(panic_message) = panic.downcast_ref::<&str>() {
-                            #[cfg(feature = "log")]
-                            error!(
-                                "winpipe::WinListener::accept server thread panicked reason={}",
-                                panic_message
-                            );
-                            Err(Error::new(ErrorKind::Other, panic_message.to_string()))
-                        } else if let Some(panic_message) = panic.downcast_ref::<String>() {
-                            #[cfg(feature = "log")]
-                            error!(
-                                "winpipe::WinListener::accept server thread panicked reason={}",
-                                panic_message
-                            );
-                            Err(Error::new(ErrorKind::Other, panic_message.to_string()))
-                        } else {
-                            #[cfg(feature = "log")]
-                            error!("winpipe::WinListener::accept server thread panicked");
-                            Err(Error::new(
-                                ErrorKind::Other,
-                                "Server thread panicked without providing a message",
-                            ))
-                        }
+                        let message = fetch_panic_message(&panic);
+                        #[cfg(feature = "log")]
+                        error!("winpipe::WinListener::accept server thread panicked reason={message}");
+
+                        Err(Error::other(message))
                     }
-                },
-                None => unreachable!("guard.join_handle.take()=>None"),
-            };
+                })
         };
 
         if self.0.nonblocking.load(SeqCst) {
@@ -680,11 +666,23 @@ impl WinListener {
 /// Internal state of the pseudo listener.
 #[derive(Debug)]
 struct WinListenState {
+    /// Address of the listener
     addr: WinPipeSocketAddr,
+
+    /// non blocking flag
     nonblocking: AtomicBool,
+
+    /// Reject remote flag
     reject_remote: AtomicBool,
+
+    /// Closed flag set in the drop impl
     closed: Arc<AtomicBool>,
+
+    /// Sender to notify in changes of nonblocking or finish accepting a operation.
+    /// true, pipe was accepeted, false nonblocking state was changed.
     sender: Sender<bool>,
+
+    /// Receiver mutex that contains a current ongoing async accept operation.
     receiver: Mutex<WinListenRcv>,
 }
 
@@ -696,9 +694,12 @@ impl Drop for WinListenState {
     }
 }
 
+/// Helper struct that acts like a join handle that can be polled with a timeout.
 #[derive(Debug)]
 struct WinListenRcv {
+    /// The join handle of the current connecting operation or None if none is in progress.
     join_handle: Option<JoinHandle<io::Result<WinPipe>>>,
+    /// The receiver to cancel
     receiver: Receiver<bool>,
 }
 
@@ -706,25 +707,38 @@ struct WinListenRcv {
 pub struct WinStream(Arc<WinPipe>, WinPipeSocketAddr);
 
 impl WinStream {
-    pub fn connect<P: AsRef<Path>>(path: P) -> io::Result<WinStream> {
+
+    /// Connect to a given address with a timeout of 10s.
+    /// # Errors
+    /// If connecting fails
+    pub fn connect<P: AsRef<Path>>(path: P) -> io::Result<Self> {
         Self::connect_addr(&WinPipeSocketAddr::from_pathname(path)?)
     }
 
+    /// Connect to a given address with a specified timeout.
+    /// # Errors
+    /// If connecting fails
     pub fn connect_with_timeout<P: AsRef<Path>>(
         path: P,
         timeout: Duration,
-    ) -> io::Result<WinStream> {
+    ) -> io::Result<Self> {
         Self::connect_addr_with_timeout(&WinPipeSocketAddr::from_pathname(path)?, timeout)
     }
 
-    pub fn connect_addr(socket_addr: &WinPipeSocketAddr) -> io::Result<WinStream> {
+    /// Connect to a given address with a timeout of 10s.
+    /// # Errors
+    /// If connecting fails
+    pub fn connect_addr(socket_addr: &WinPipeSocketAddr) -> io::Result<Self> {
         Self::connect_addr_with_timeout(socket_addr, Duration::from_millis(10000))
     }
 
+    /// Connect to a given address with a specified timeout.
+    /// # Errors
+    /// If connecting fails
     pub fn connect_addr_with_timeout(
         socket_addr: &WinPipeSocketAddr,
         timeout: Duration,
-    ) -> io::Result<WinStream> {
+    ) -> io::Result<Self> {
         client(socket_addr.1.as_str(), timeout)
             .map_err(|e| {
                 if e.kind() == ErrorKind::TimedOut {
@@ -732,10 +746,13 @@ impl WinStream {
                 }
                 e
             })
-            .map(|pipe| WinStream(Arc::new(pipe), socket_addr.clone()))
+            .map(|pipe| Self(Arc::new(pipe), socket_addr.clone()))
     }
 
-    pub fn pair() -> io::Result<(WinStream, WinStream)> {
+    /// Returns 2 pipes that are connected to each other
+    /// # Errors
+    /// If creating and or connecting the pipes fails.
+    pub fn pair() -> io::Result<(Self, Self)> {
         let rand = WinPipeSocketAddr::from_random_name();
         let (sender, receiver) = channel();
 
@@ -763,17 +780,17 @@ impl WinStream {
                         "winpipe::WinStream::pair server thread panicked reason={}",
                         pm.as_str()
                     );
-                    Err(Error::new(
-                        ErrorKind::Other,
+                    Err(Error::other(
                         format!("server thread panicked reason={}", pm.as_str()),
                     ))
                 }
             };
         }
 
-        let res = client(rand.1.as_str(), Duration::from_millis(10_000)).inspect_err(|_e| {
+        let res = client(rand.1.as_str(), Duration::from_millis(10_000)).inspect_err(|e| {
             #[cfg(feature = "log")]
-            error!("winpipe::WinStream::pair client failed to connect={}", _e)
+            error!("winpipe::WinStream::pair client failed to connect={e}");
+            _=e;
         });
         let srv = match join.join() {
             Ok(r) => r,
@@ -784,94 +801,123 @@ impl WinStream {
                     "winpipe::WinStream::pair server thread panicked reason={}",
                     pm.as_str()
                 );
-                Err(Error::new(
-                    ErrorKind::Other,
+                Err(Error::other(
                     format!("server thread panicked reason={}", pm.as_str()),
                 ))
             }
         };
 
         Ok((
-            WinStream(Arc::new(res?), rand.clone()),
-            WinStream(Arc::new(srv?), rand),
+            Self(Arc::new(res?), rand.clone()),
+            Self(Arc::new(srv?), rand),
         ))
     }
 
+    /// Returns the local address of the pipe
+    /// # Errors
+    /// This function never fails
     pub fn local_addr(&self) -> io::Result<WinPipeSocketAddr> {
         Ok(self.1.clone())
     }
 
+    /// Returns the peer address of the pipe
+    /// # Errors
+    /// This function never fails
     pub fn peer_addr(&self) -> io::Result<WinPipeSocketAddr> {
         Ok(self.1.clone())
     }
 
+    /// "Clones" the pipe. This only increases a ref counter and does nothing else.
+    /// # Errors
+    /// This function never fails
     pub fn try_clone(&self) -> io::Result<Self> {
-        Ok(Self(self.0.clone(), self.1.clone()))
+        Ok(Self(Arc::clone(&self.0), self.1.clone()))
     }
 
+    /// Returns the write timeout
+    /// # Errors
+    /// This function can't fail.
     pub fn write_timeout(&self) -> io::Result<Option<Duration>> {
         let wt = self.0.write_timeout.load(SeqCst);
-        Ok(if wt >= 0 {
-            Some(Duration::from_millis(wt as u64))
-        } else {
-            None
-        })
+        if let Ok(wt) = u64::try_from(wt) {
+            return Ok(Some(Duration::from_millis(wt)))
+        }
+
+        Ok(None)
     }
 
+
+    /// Sets the write timeout of the pipe. this affects writing to the pipe.
+    /// # Errors
+    /// If waking up threads currently writing fails.
     pub fn set_write_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
         self.0.write_timeout.store(
             timeout
-                .map(|t| u128::min(i64::MAX as u128, t.as_millis()) as i64)
-                .unwrap_or(-1),
+                .map_or(-1, |t| i64::try_from(t.as_millis()).unwrap_or(i64::MAX)),
             SeqCst,
         );
         self.0.notify_write()
     }
 
+    /// Returns the read timeout
+    /// # Errors
+    /// This function can't fail.
     pub fn read_timeout(&self) -> io::Result<Option<Duration>> {
         let rt = self.0.read_timeout.load(SeqCst);
-        Ok(if rt >= 0 {
-            Some(Duration::from_millis(rt as u64))
-        } else {
-            None
-        })
+        if let Ok(rt) = u64::try_from(rt) {
+            return Ok(Some(Duration::from_millis(rt)))
+        }
+
+        Ok(None)
     }
 
+    /// Sets the read timeout of the pipe. this affects reading from the pipe.
+    /// # Errors
+    /// If waking up threads currently reading fails.
     pub fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
         self.0.read_timeout.store(
             timeout
-                .map(|t| u128::min(i64::MAX as u128, t.as_millis()) as i64)
-                .unwrap_or(-1),
+                .map_or(-1, |t| i64::try_from(t.as_millis()).unwrap_or(i64::MAX)),
             SeqCst,
         );
         self.0.notify_read()
     }
 
+    /// Shuts down the pipe for reading or writing.
+    /// This will wake up threads stuck reading/writing and cause them to err.
+    /// # Errors
+    /// if waking up the threads fails.
     pub fn shutdown(&self, how: Shutdown) -> io::Result<()> {
         match how {
             Shutdown::Read => {
                 self.0.read_shutdown.store(true, SeqCst);
-                self.0.notify_read()?
+                self.0.notify_read()?;
             }
             Shutdown::Write => {
                 self.0.write_shutdown.store(true, SeqCst);
-                self.0.notify_read()?
+                self.0.notify_read()?;
             }
             Shutdown::Both => {
                 self.0.read_shutdown.store(true, SeqCst);
                 self.0.write_shutdown.store(true, SeqCst);
                 let e = self.0.notify_read();
                 self.0.notify_write()?;
-                e?
+                e?;
             }
         }
         Ok(())
     }
 
-    pub fn take_error(&self) -> io::Result<Option<Error>> {
+    /// This function is a noop and  always returns Ok(None) and is just kept for compatibility reasons.
+    /// # Errors
+    /// This function never errors
+    pub const fn take_error(&self) -> io::Result<Option<Error>> {
         Ok(None)
     }
 
+    /// Sets reading and writing to nonblocking or disables non-blocking.
+    /// # Errors
+    /// This function never errors
     pub fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
         self.0.nonblocking.store(nonblocking, SeqCst);
         if nonblocking {
@@ -902,23 +948,45 @@ impl Read for WinStream {
     }
 }
 
+/// Holds the state of a connected pipe
 #[derive(Debug)]
 struct WinPipe {
+    /// Windows handle for the pipe
     pipe_handle: SyncMutPtr<c_void>,
+
+    /// Windows handle to the event used for overlapped reading.
     event_read: SyncMutPtr<c_void>,
+
+    /// Windows handle to the event used for overlapped writing.
     event_write: SyncMutPtr<c_void>,
+
+    /// Mutex for the reading overlapped memory.
     mutex_read: Mutex<Pin<Box<PinnedOverlapped>>>,
+
+    /// Mutex for the writing overlapped memory.
     mutex_write: Mutex<Pin<Box<PinnedOverlapped>>>,
+
+    /// flag if read is shutdown
     read_shutdown: AtomicBool,
+
+    /// Flag if writing is shutdown
     write_shutdown: AtomicBool,
+
+    /// Non blocking flag
     nonblocking: AtomicBool,
+
+    /// Read timeout
     read_timeout: AtomicI64,
+
+    /// Write timeout
     write_timeout: AtomicI64,
 }
 
 impl WinPipe {
-    unsafe fn new(pipe: HANDLE, read_event: HANDLE, write_event: HANDLE) -> WinPipe {
-        WinPipe {
+
+    /// Constructor
+    unsafe fn new(pipe: HANDLE, read_event: HANDLE, write_event: HANDLE) -> Self {
+        Self {
             pipe_handle: pipe.0.as_sync_mut(),
             event_read: read_event.0.as_sync_mut(),
             event_write: write_event.0.as_sync_mut(),
@@ -932,6 +1000,8 @@ impl WinPipe {
         }
     }
 
+
+    /// Sets the read event to a signal state
     fn notify_read(&self) -> io::Result<()> {
         unsafe {
             if SetEvent(HANDLE(self.event_read.inner())).is_err() {
@@ -941,6 +1011,7 @@ impl WinPipe {
         Ok(())
     }
 
+    /// Sets the write event to a signal state
     fn notify_write(&self) -> io::Result<()> {
         unsafe {
             if SetEvent(HANDLE(self.event_write.inner())).is_err() {
@@ -973,6 +1044,7 @@ impl WinPipe {
         res
     }
 
+    /// Write data to the pipe
     fn write(&self, buf: &[u8]) -> io::Result<usize> {
         if buf.len() > 0xFFFF_FFF0 {
             return self.write(&buf[..0xFFFF_FFF0]);
@@ -1003,7 +1075,9 @@ impl WinPipe {
 
         guard.as_mut().reset(HANDLE(self.event_write.inner()));
 
-        let mut count = buf.len() as u32;
+        let mut count = u32::try_from(buf.len())
+            .expect("WinPipe::write buf.len() > u32::MAX but smaller than 0xFFFF_FFF0, how?");
+
         #[cfg(feature = "log")]
         trace!(
             "WriteFile({:p}, &mut [u8]={}, &mut u32={}, {:p})",
@@ -1016,11 +1090,11 @@ impl WinPipe {
             coerce_error(WriteFile(
                 HANDLE(self.pipe_handle.inner()),
                 Some(buf),
-                Some(&mut count),
+                Some(&raw mut count),
                 Some(guard.as_mut().as_mut_param()),
             ))
             .or_else(|e| permit_error(e, ErrorKind::WouldBlock, ()))
-            .map(|_| {
+            .map(|()| {
                 #[cfg(feature = "log")]
                 trace!(
                     "WriteFile({:p}, &mut [u8]={}, &mut u32={}, {:p})=()",
@@ -1028,9 +1102,9 @@ impl WinPipe {
                     buf.len(),
                     count,
                     guard.as_ref().as_const_param()
-                )
+                );
             })
-            .inspect_err(|_e| {
+            .inspect_err(|e| {
                 #[cfg(feature = "log")]
                 error!(
                     "WriteFile({:p}, &mut [u8]={}, &mut u32={}, {:p})={}",
@@ -1038,9 +1112,10 @@ impl WinPipe {
                     buf.len(),
                     count,
                     guard.as_ref().as_const_param(),
-                    _e
-                )
-            })?
+                    e
+                );
+                _=e;
+            })?;
         };
 
         let did_write = unsafe {
@@ -1050,12 +1125,12 @@ impl WinPipe {
                 &mut count,
                 false,
             )
-            .map(|_| true)
+            .map(|()| true)
             .or_else(|e| permit_error(e, ErrorKind::WouldBlock, false))?
         };
 
         if did_write {
-            //Data must have been in the buffer already and windows simply issued a mem-copy which is already done?
+            //Data must have been in the buffer already, and windows simply issued a mem-copy which is already done?
             #[cfg(feature = "log")]
             trace!(
                 "winpipe::WinPipe::write({:p}, &mut [u8]={})=Ok({})",
@@ -1084,9 +1159,10 @@ impl WinPipe {
                     Some(guard.as_ref().as_const_param()),
                 )
                 .or_else(|e| permit_error(e, ErrorKind::NotFound, ()))
-                .inspect_err(|_e| {
+                .inspect_err(|e| {
                     #[cfg(feature = "log")]
-                    warn!("IGNORE ERROR={}", _e);
+                    warn!("IGNORE ERROR={e}");
+                    _=e;
                 });
 
                 //If this returns without windows stopping to use the memory we are screwed.
@@ -1096,7 +1172,7 @@ impl WinPipe {
                     &mut count,
                     true,
                 )
-                .map(|_| true)
+                .map(|()| true)
                 .or_else(|e| permit_error(e, ErrorKind::ConnectionAborted, false))?;
 
                 //We also have the chance of windows having already "read" data
@@ -1132,16 +1208,15 @@ impl WinPipe {
             }
         }
 
-        let timeout = if timeout < 0 {
-            INFINITE
-        } else {
-            i64::min(timeout, (INFINITE - 1) as i64) as u32
-        };
+        let timeout = u32::try_from(timeout)
+            .map(|tm| tm.min(INFINITE-1))
+            .unwrap_or(INFINITE);
 
         unsafe {
-            _ = wait_for_event(HANDLE(self.event_write.inner()), timeout).inspect_err(|_e| {
+            _ = wait_for_event(HANDLE(self.event_write.inner()), timeout).inspect_err(|e| {
                 #[cfg(feature = "log")]
-                warn!("IGNORE ERROR={}", _e)
+                warn!("IGNORE ERROR={e}");
+                _=e;
             });
 
             let did_read = get_overlapped_result(
@@ -1150,7 +1225,7 @@ impl WinPipe {
                 &mut count,
                 false,
             )
-            .map(|_| true)
+            .map(|()| true)
             .or_else(|e| permit_error(e, ErrorKind::WouldBlock, false))?;
 
             if did_read {
@@ -1182,9 +1257,10 @@ impl WinPipe {
                 Some(guard.as_ref().as_const_param()),
             )
             .or_else(|e| permit_error(e, ErrorKind::NotFound, ()))
-            .inspect_err(|_e| {
+            .inspect_err(|e| {
                 #[cfg(feature = "log")]
-                warn!("IGNORE ERROR={}", _e)
+                warn!("IGNORE ERROR={e}");
+                _=e;
             });
 
             //If this returns without windows stopping to use the memory we are screwed.
@@ -1194,7 +1270,7 @@ impl WinPipe {
                 &mut count,
                 true,
             )
-            .map(|_| true)
+            .map(|()| true)
             .or_else(|e| permit_error(e, ErrorKind::ConnectionAborted, false))?;
 
             //We also have the chance of windows having already "written" data
@@ -1217,6 +1293,7 @@ impl WinPipe {
                 self.pipe_handle,
                 buf.len()
             );
+            drop(guard);
             Err(ErrorKind::TimedOut.into())
         }
     }
@@ -1224,6 +1301,9 @@ impl WinPipe {
     /// Read from the pipe
     fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
         if buf.len() > 0xFFFF_FFF0 {
+            // Windows wants a DWORD, which is u32. on 64 bit rust "could"
+            // allocate a slice larger than 4gib which windows cannot read into in one go.
+            // The contract only requires us to read 1 byte, so we simply read up to about 4Gib.
             return self.read(&mut buf[..0xFFFF_FFF0]);
         }
         let buf_len = buf.len();
@@ -1240,7 +1320,10 @@ impl WinPipe {
         defer! {
             trace!("leaving winpipe::WinPipe::read({:p}, &mut [u8]={}) took={}ms panic={}", self.pipe_handle, buf_len, start.elapsed().as_millis(), thread::panicking());
         }
-        let mut guard = self.mutex_read.lock().unwrap();
+        let mut guard = self.mutex_read.lock()
+            .map_err(|_| Error::other("mutex_read poisoned"))?;
+
+
         #[cfg(feature = "log")]
         trace!("locked winpipe::WinPipe::read {:p}", self.pipe_handle);
 
@@ -1250,7 +1333,9 @@ impl WinPipe {
 
         guard.as_mut().reset(HANDLE(self.event_read.inner()));
 
-        let mut count = buf_len as u32;
+        let mut count = u32::try_from(buf_len)
+            .expect("WinPipe::read buf_len > u32::MAX but smaller than 0xFFFF_FFF0, how?");
+
         #[cfg(feature = "log")]
         trace!(
             "ReadFile({:p}, &mut [u8]={}, &mut u32={}, {:p})",
@@ -1263,11 +1348,11 @@ impl WinPipe {
             coerce_error(ReadFile(
                 HANDLE(self.pipe_handle.inner()),
                 Some(buf),
-                Some(&mut count),
+                Some(&raw mut count),
                 Some(guard.as_mut().as_mut_param()),
             ))
             .or_else(|e| permit_error(e, ErrorKind::WouldBlock, ()))
-            .map(|_| {
+            .map(|()| {
                 #[cfg(feature = "log")]
                 trace!(
                     "ReadFile({:p}, &mut [u8]={}, &mut u32={}, {:p})=()",
@@ -1275,9 +1360,9 @@ impl WinPipe {
                     buf_len,
                     count,
                     guard.as_ref().as_const_param()
-                )
+                );
             })
-            .inspect_err(|_e| {
+            .inspect_err(|e| {
                 #[cfg(feature = "log")]
                 error!(
                     "ReadFile({:p}, &mut [u8]={}, &mut u32={}, {:p})={}",
@@ -1285,9 +1370,10 @@ impl WinPipe {
                     buf_len,
                     count,
                     guard.as_ref().as_const_param(),
-                    _e
-                )
-            })?
+                    e
+                );
+                _=e;
+            })?;
         };
 
         let did_read = unsafe {
@@ -1297,7 +1383,7 @@ impl WinPipe {
                 &mut count,
                 false,
             )
-            .map(|_| true)
+            .map(|()| true)
             .or_else(|e| permit_error(e, ErrorKind::WouldBlock, false))?
         };
 
@@ -1331,19 +1417,20 @@ impl WinPipe {
                     Some(guard.as_ref().as_const_param()),
                 )
                 .or_else(|e| permit_error(e, ErrorKind::NotFound, ()))
-                .inspect_err(|_e| {
+                .inspect_err(|e| {
                     #[cfg(feature = "log")]
-                    warn!("IGNORE ERROR={}", _e)
+                    warn!("IGNORE ERROR={e}");
+                    _=e;
                 });
 
-                //If this returns without windows stopping to use the memory we are screwed.
+                //If this returns without windows stopping to use the memory, we are screwed.
                 let did_read = get_overlapped_result(
                     HANDLE(self.pipe_handle.inner()),
                     guard.as_ref().as_const_param(),
                     &mut count,
                     true,
                 )
-                .map(|_| true)
+                .map(|()| true)
                 .or_else(|e| permit_error(e, ErrorKind::ConnectionAborted, false))?;
 
                 //We also have the chance of windows having already "read" data
@@ -1380,16 +1467,15 @@ impl WinPipe {
             }
         }
 
-        let timeout = if timeout < 0 {
-            INFINITE
-        } else {
-            i64::min(timeout, (INFINITE - 1) as i64) as u32
-        };
+        let timeout = u32::try_from(timeout)
+            .map(|tm| tm.min(INFINITE-1))
+            .unwrap_or(INFINITE);
 
         unsafe {
-            _ = wait_for_event(HANDLE(self.event_read.inner()), timeout).inspect_err(|_e| {
+            _ = wait_for_event(HANDLE(self.event_read.inner()), timeout).inspect_err(|e| {
                 #[cfg(feature = "log")]
-                warn!("IGNORE ERROR={}", _e)
+                warn!("IGNORE ERROR={e}");
+                _=e;
             });
 
             let did_read = get_overlapped_result(
@@ -1398,7 +1484,7 @@ impl WinPipe {
                 &mut count,
                 false,
             )
-            .map(|_| true)
+            .map(|()| true)
             .or_else(|e| permit_error(e, ErrorKind::WouldBlock, false))?;
 
             if did_read {
@@ -1419,30 +1505,31 @@ impl WinPipe {
                 buf.len()
             );
 
-            //Depending on what windows does there is potential here to corrupt the program.
+            //Depending on what Windows does, there is potential here to corrupt the program.
             //We are only concerned about getting windows to stop using the Heap allocated OVERLAPPED
             //and buf which is allocated "somewhere".
-            //If we do not succeed in doing so our program will get corrupted and there is sadly no way to know for sure with windows.
+            //If we do not succeed in doing so, our program will get corrupted, and there is sadly no way to know for sure with windows.
 
-            //This failing is not a problem, worst case is next call blocks forever
+            //This failing is not a problem, the worst case is next call blocks forever
             _ = cancel_io_ex(
                 HANDLE(self.pipe_handle.inner()),
                 Some(guard.as_ref().as_const_param()),
             )
             .or_else(|e| permit_error(e, ErrorKind::NotFound, ()))
-            .inspect_err(|_e| {
+            .inspect_err(|e| {
                 #[cfg(feature = "log")]
-                warn!("IGNORE ERROR={}", _e)
+                warn!("IGNORE ERROR={e}");
+                _=e;
             });
 
-            //If this returns without windows stopping to use the memory we are screwed.
+            //If this returns without windows stopping to use the memory, we are screwed.
             let did_read = get_overlapped_result(
                 HANDLE(self.pipe_handle.inner()),
                 guard.as_ref().as_const_param(),
                 &mut count,
                 true,
             )
-            .map(|_| true)
+            .map(|()| true)
             .or_else(|e| permit_error(e, ErrorKind::ConnectionAborted, false))?;
 
             //We also have the chance of windows having already "read" data
@@ -1465,6 +1552,7 @@ impl WinPipe {
                 self.pipe_handle,
                 buf.len()
             );
+            drop(guard);
             Err(ErrorKind::TimedOut.into())
         }
     }
@@ -1607,7 +1695,7 @@ impl Drop for WinPipe {
                     Err(e) => {
                         #[cfg(feature = "log")]
                         error!("Drop WinPipe {:p} flush thread panicked reason={}. Will close handle now.",  self.pipe_handle, fetch_panic_message(&e));
-
+                        _=e;
                         close_handle(HANDLE(self.pipe_handle.inner()));
                         close_handle(thread_handle);
                     }

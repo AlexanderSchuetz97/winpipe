@@ -79,11 +79,11 @@ pub fn test_drop_does_flush() {
     for (i, n) in data.iter_mut().enumerate() {
         *n = i as u8;
     }
-    stream1.write(data.as_mut_slice()).unwrap();
+    stream1.write_all(data.as_mut_slice()).unwrap();
     let jh = thread::spawn(move || {
         let mut dbuf = vec![0u8; 128];
         thread::sleep(Duration::from_millis(1000));
-        stream2.read(dbuf.as_mut_slice()).unwrap();
+        stream2.read_exact(dbuf.as_mut_slice()).unwrap();
         drop(stream2);
         return dbuf;
     });
@@ -108,7 +108,7 @@ pub fn test_read_to_end() {
         stream2.read_to_end(&mut dbuf).unwrap();
         return dbuf;
     });
-    stream1.write(data.as_mut_slice()).unwrap();
+    stream1.write_all(data.as_mut_slice()).unwrap();
     thread::sleep(Duration::from_millis(1000));
     drop(stream1);
     let read = jh.join().unwrap();
@@ -169,7 +169,7 @@ pub fn test_listen() {
     thread::spawn(|| {
         let mut stream = WinStream::connect("\\\\.\\pipe\\my_pipe").unwrap();
         thread::sleep(Duration::from_millis(1000));
-        stream.write("OK".as_bytes()).unwrap();
+        stream.write_all("OK".as_bytes()).unwrap();
     });
     let (mut pip, _) = pipe.accept().unwrap();
     let mut dta = Vec::new();
